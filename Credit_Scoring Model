@@ -1,0 +1,263 @@
+# src/models/credit_scoring/model.py
+"""
+Credit scoring model for PAYG energy access
+Uses XGBoost with comprehensive feature engineering
+"""
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import roc_auc_score, precision_recall_curve, f1_score
+import xgboost as xgb
+import mlflow
+import mlflow.xgboost
+from typing import Dict, Tuple
+from src.config.logging_config import logger, log_function_call
+from src.models.credit_scoring.features import FeatureEngineer
+
+
+class CreditScoringModel:
+    """
+    XGBoost-based credit scoring for energy customers
+    Predicts payment reliability for PAYG systems
+    """
+    
+    def __init__(self, model_params: Dict = None):
+        """
+        Initialize model with parameters
+        
+        Args:
+            model_params: XGBoost parameters
+        """
+        self.model_params = model_params or {
+            'max_depth': 6,
+            'learning_rate': 0.1,
+            'n_estimators': 100,
+            'objective': 'binary:logistic',
+            'eval_metric': 'auc',
+            'scale_pos_weight': 1,
+            'random_state': 42
+        }
+        self.model = None
+        self.feature_engineer = FeatureEngineer()
+        self.feature_names = None
+        
+    @log_function_call
+    def prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Prepare features for training/prediction
+        
+        Args:
+            df: Raw input data
+            
+        Returns:
+            Feature-engineered DataFrame
+        """
+        logger.info(f"Preparing features for {len(df)} records")
+        
+        # Engineer features
+        df = self.feature_engineer.create_payment_features(df)
+        df = self.feature_engineer.create_usage_features(df)
+        df = self.feature_engineer.create_demographic_features(df)
+        
+        # Handle missing values
+        df = df.fillna({
+            'avg_payment_amount': df['avg_payment_amount'].median(),
+            'payment_frequency': 0,
+            'days_since_last_payment': df['days_since_last_payment'].max(),
+            'usage_consistency': df['usage_consistency'].median()
+        })
+        
+        logger.info(f"Feature preparation complete. Shape: {df.shape}")
+        return df
+    
+    @log_function_call
+    def train(self, X_train: pd.DataFrame, y_train: pd.Series, 
+              X_val: pd.DataFrame = None, y_val: pd.Series = None,
+              experiment_name: str = "credit_scoring") -> Dict:
+        """
+        Train XGBoost model with MLflow tracking
+        
+        Args:
+            X_train: Training features
+            y_train: Training labels
+            X_val: Validation features
+            y_val: Validation labels
+            experiment_name: MLflow experiment name
+            
+        Returns:
+            Dict with training metrics
+        """
+        mlflow.set_experiment(experiment_name)
+        
+        with mlflow.start_run():
+            # Log parameters
+            mlflow.log_params(self.model_params)
+            
+            # Store feature names
+            self.feature_names = X_train.columns.tolist()
+            mlflow.log_param("n_features", len(self.feature_names))
+            
+            # Create DMatrix for XGBoost
+            dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=self.feature_names)
+            
+            evals = [(dtrain, 'train')]
+            if X_val is not None and y_val is not None:
+                dval = xgb.DMatrix(X_val, label=y_val, feature_names=self.feature_names)
+                evals.append((dval, 'val'))
+            
+            # Train model
+            logger.info("Starting model training...")
+            self.model = xgb.train(
+                self.model_params,
+                dtrain,
+                num_boost_round=self.model_params.get('n_estimators', 100),
+                evals=evals,
+                early_stopping_rounds=10,
+                verbose_eval=False
+            )
+            
+            # Evaluate on training set
+            train_pred = self.model.predict(dtrain)
+            train_auc = roc_auc_score(y_train, train_pred)
+            mlflow.log_metric("train_auc", train_auc)
+            
+            # Evaluate on validation set
+            if X_val is not None:
+                val_pred = self.model.predict(dval)
+                val_auc = roc_auc_score(y_val, val_pred)
+                val_f1 = f1_score(y_val, (val_pred > 0.5).astype(int))
+                
+                mlflow.log_metric("val_auc", val_auc)
+                mlflow.log_metric("val_f1", val_f1)
+                
+                logger.info(f"Validation AUC: {val_auc:.4f}, F1: {val_f1:.4f}")
+            
+            # Log feature importance
+            importance_dict = self.model.get_score(importance_type='gain')
+            mlflow.log_dict(importance_dict, "feature_importance.json")
+            
+            # Log model
+            mlflow.xgboost.log_model(self.model, "model")
+            
+            metrics = {
+                'train_auc': train_auc,
+                'val_auc': val_auc if X_val is not None else None,
+                'val_f1': val_f1 if X_val is not None else None
+            }
+            
+            logger.info(f"Model training complete. Metrics: {metrics}")
+            return metrics
+    
+    @log_function_call
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Generate predictions
+        
+        Args:
+            X: Input features
+            
+        Returns:
+            Array of prediction probabilities
+        """
+        if self.model is None:
+            raise ValueError("Model not trained. Call train() first.")
+        
+        dmatrix = xgb.DMatrix(X, feature_names=self.feature_names)
+        predictions = self.model.predict(dmatrix)
+        
+        logger.info(f"Generated predictions for {len(X)} records")
+        return predictions
+    
+    def predict_with_explanation(self, X: pd.DataFrame) -> Tuple[np.ndarray, pd.DataFrame]:
+        """
+        Generate predictions with SHAP explanations
+        
+        Returns:
+            (predictions, feature_contributions_df)
+        """
+        import shap
+        
+        predictions = self.predict(X)
+        
+        # Calculate SHAP values
+        explainer = shap.TreeExplainer(self.model)
+        shap_values = explainer.shap_values(X)
+        
+        # Create explanation DataFrame
+        explanations = pd.DataFrame(
+            shap_values,
+            columns=self.feature_names,
+            index=X.index
+        )
+        
+        return predictions, explanations
+    
+    def get_feature_importance(self, top_n: int = 20) -> pd.DataFrame:
+        """Get top N most important features"""
+        
+        if self.model is None:
+            raise ValueError("Model not trained")
+        
+        importance = self.model.get_score(importance_type='gain')
+        importance_df = pd.DataFrame([
+            {'feature': k, 'importance': v}
+            for k, v in importance.items()
+        ]).sort_values('importance', ascending=False).head(top_n)
+        
+        return importance_df
+    
+    def save_model(self, path: str):
+        """Save model to disk"""
+        if self.model is None:
+            raise ValueError("No model to save")
+        
+        self.model.save_model(path)
+        logger.info(f"Model saved to {path}")
+    
+    def load_model(self, path: str):
+        """Load model from disk"""
+        self.model = xgb.Booster()
+        self.model.load_model(path)
+        logger.info(f"Model loaded from {path}")
+
+
+# src/models/credit_scoring/features.py
+"""Feature engineering for credit scoring"""
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+
+class FeatureEngineer:
+    """Create features for credit scoring model"""
+    
+    def create_payment_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create payment-related features"""
+        
+        df['avg_payment_amount'] = df.groupby('customer_id')['payment_amount'].transform('mean')
+        df['payment_frequency'] = df.groupby('customer_id')['payment_date'].transform('count')
+        df['days_since_last_payment'] = (datetime.now() - pd.to_datetime(df['last_payment_date'])).dt.days
+        df['payment_variability'] = df.groupby('customer_id')['payment_amount'].transform('std')
+        df['on_time_payment_ratio'] = df.groupby('customer_id')['on_time'].transform('mean')
+        
+        return df
+    
+    def create_usage_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create energy usage features"""
+        
+        df['avg_daily_usage'] = df.groupby('customer_id')['kwh_used'].transform('mean')
+        df['usage_consistency'] = 1 - (df.groupby('customer_id')['kwh_used'].transform('std') / 
+                                       df.groupby('customer_id')['kwh_used'].transform('mean'))
+        df['peak_hour_usage'] = df.groupby('customer_id')['peak_usage'].transform('sum')
+        df['weekend_usage_ratio'] = df.groupby('customer_id')['weekend_usage'].transform('mean')
+        
+        return df
+    
+    def create_demographic_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create demographic and contextual features"""
+        
+        df['account_age_days'] = (datetime.now() - pd.to_datetime(df['account_created_date'])).dt.days
+        df['urban_rural'] = df['location_type'].map({'urban': 1, 'rural': 0})
+        df['household_size_norm'] = df['household_size'] / df['household_size'].max()
+        
+        return df
