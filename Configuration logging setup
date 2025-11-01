@@ -1,0 +1,155 @@
+# src/config/settings.py
+"""
+Configuration management for Kenya Energy AI System
+Handles environment variables and application settings
+"""
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from typing import Optional
+import os
+
+
+class Settings(BaseSettings):
+    """Application settings with validation"""
+    
+    # Project Info
+    PROJECT_NAME: str = "Kenya Energy Access AI"
+    VERSION: str = "1.0.0"
+    ENVIRONMENT: str = Field(default="development", env="ENV")
+    
+    # Database
+    DB_HOST: str = Field(default="localhost", env="DB_HOST")
+    DB_PORT: int = Field(default=5432, env="DB_PORT")
+    DB_NAME: str = Field(default="energy_db", env="DB_NAME")
+    DB_USER: str = Field(default="admin", env="DB_USER")
+    DB_PASSWORD: str = Field(default="", env="DB_PASSWORD")
+    
+    # AWS Configuration
+    AWS_ACCESS_KEY_ID: Optional[str] = Field(default=None, env="AWS_ACCESS_KEY_ID")
+    AWS_SECRET_ACCESS_KEY: Optional[str] = Field(default=None, env="AWS_SECRET_ACCESS_KEY")
+    AWS_REGION: str = Field(default="us-east-1", env="AWS_REGION")
+    S3_BUCKET_NAME: str = Field(default="kenya-energy-data", env="S3_BUCKET_NAME")
+    
+    # Model Configuration
+    MODEL_VERSION: str = "v1.0"
+    MODELS_DIR: str = "models/saved"
+    LOGS_DIR: str = "logs"
+    
+    # Data Pipeline
+    DATA_LAKE_PATH: str = Field(default="s3://kenya-energy-data/", env="DATA_LAKE_PATH")
+    BATCH_SIZE: int = Field(default=1000, env="BATCH_SIZE")
+    
+    # API Configuration
+    API_HOST: str = Field(default="0.0.0.0", env="API_HOST")
+    API_PORT: int = Field(default=8000, env="API_PORT")
+    API_KEY: Optional[str] = Field(default=None, env="API_KEY")
+    
+    # Monitoring
+    ENABLE_BIAS_MONITORING: bool = True
+    ENABLE_DRIFT_DETECTION: bool = True
+    ALERT_EMAIL: Optional[str] = Field(default=None, env="ALERT_EMAIL")
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+
+settings = Settings()
+
+
+# src/config/logging_config.py
+"""
+Centralized logging configuration
+"""
+import logging
+import logging.handlers
+import os
+from datetime import datetime
+from pathlib import Path
+
+
+def setup_logging(
+    log_level: str = "INFO",
+    log_dir: str = "logs",
+    log_to_file: bool = True,
+    log_to_console: bool = True
+) -> logging.Logger:
+    """
+    Configure application-wide logging
+    
+    Args:
+        log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_dir: Directory for log files
+        log_to_file: Enable file logging
+        log_to_console: Enable console logging
+        
+    Returns:
+        Configured logger instance
+    """
+    
+    # Create logs directory
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Create logger
+    logger = logging.getLogger("kenya_energy_ai")
+    logger.setLevel(getattr(logging, log_level.upper()))
+    
+    # Clear existing handlers
+    logger.handlers = []
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        fmt='%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Console handler
+    if log_to_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+    
+    # File handler (rotating)
+    if log_to_file:
+        log_file = os.path.join(log_dir, f"app_{datetime.now().strftime('%Y%m%d')}.log")
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    
+    # Error file handler
+    if log_to_file:
+        error_log_file = os.path.join(log_dir, f"error_{datetime.now().strftime('%Y%m%d')}.log")
+        error_handler = logging.handlers.RotatingFileHandler(
+            error_log_file,
+            maxBytes=10*1024*1024,
+            backupCount=5
+        )
+        error_handler.setLevel(logging.ERROR)
+        error_handler.setFormatter(formatter)
+        logger.addHandler(error_handler)
+    
+    return logger
+
+
+# Initialize default logger
+logger = setup_logging()
+
+
+def log_function_call(func):
+    """Decorator to log function calls with parameters"""
+    def wrapper(*args, **kwargs):
+        logger.info(f"Calling {func.__name__} with args={args}, kwargs={kwargs}")
+        try:
+            result = func(*args, **kwargs)
+            logger.info(f"{func.__name__} completed successfully")
+            return result
+        except Exception as e:
+            logger.error(f"{func.__name__} failed with error: {str(e)}", exc_info=True)
+            raise
+    return wrapper
