@@ -1,0 +1,291 @@
+# airflow/dags/daily_data_pipeline.py
+"""
+Daily data pipeline DAG for Kenya Energy AI System
+Orchestrates ETL, validation, anonymization, and model scoring
+"""
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.utils.task_group import TaskGroup
+import pandas as pd
+import logging
+
+from src.data_pipeline.validators import DataValidator
+from src.data_pipeline.anonymizer import DataAnonymizer
+from src.models.credit_scoring.model import CreditScoringModel
+
+# Default arguments
+default_args = {
+    'owner': 'data-team',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 1, 1),
+    'email': ['alerts@energy-ai.ke'],
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+    'execution_timeout': timedelta(hours=2)
+}
+
+# Create DAG
+dag = DAG(
+    'daily_energy_data_pipeline',
+    default_args=default_args,
+    description='Daily ETL and ML pipeline for energy data',
+    schedule_interval='0 2 * * *',  # Run at 2 AM daily
+    catchup=False,
+    tags=['energy', 'ml', 'etl']
+)
+
+
+def extract_smart_meter_data(**context):
+    """Extract data from smart meters and PAYG systems"""
+    execution_date = context['execution_date']
+    logging.info(f"Extracting data for {execution_date}")
+    
+    # Connect to PostgreSQL
+    pg_hook = PostgresHook(postgres_conn_id='energy_db')
+    
+    query = f"""
+    SELECT 
+        customer_id,
+        meter_id,
+        timestamp,
+        kwh_used,
+        payment_amount,
+        payment_method,
+        location_lat,
+        location_lon
+    FROM smart_meter_readings
+    WHERE DATE(timestamp) = '{execution_date.date()}'
+    """
+    
+    df = pg_hook.get_pandas_df(query)
+    
+    # Save to temporary location
+    temp_path = f"/tmp/raw_data_{execution_date.date()}.parquet"
+    df.to_parquet(temp_path)
+    
+    logging.info(f"Extracted {len(df)} records")
+    return temp_path
+
+
+def validate_data_quality(**context):
+    """Validate extracted data"""
+    ti = context['ti']
+    data_path = ti.xcom_pull(task_ids='extract_smart_meter_data')
+    
+    df = pd.read_parquet(data_path)
+    
+    validator = DataValidator()
+    
+    # Schema validation
+    expected_schema = {
+        'customer_id': 'object',
+        'meter_id': 'object',
+        'timestamp': 'datetime64[ns]',
+        'kwh_used': 'float64',
+        'payment_amount': 'float64'
+    }
+    
+    is_valid, errors = validator.validate_schema(df, expected_schema)
+    if not is_valid:
+        raise ValueError(f"Schema validation failed: {errors}")
+    
+    # Check missing values
+    missing_stats = validator.check_missing_values(df, threshold=0.3)
+    if missing_stats:
+        logging.warning(f"Missing values detected: {missing_stats}")
+    
+    # Detect outliers
+    outliers = validator.detect_outliers(df, ['kwh_used', 'payment_amount'])
+    logging.info(f"Outliers detected: {outliers}")
+    
+    # Data freshness
+    is_fresh = validator.check_data_freshness(df, 'timestamp', max_age_hours=48)
+    if not is_fresh:
+        logging.warning("Data is not fresh")
+    
+    logging.info("Data validation completed successfully")
+    return data_path
+
+
+def anonymize_pii(**context):
+    """Anonymize personally identifiable information"""
+    ti = context['ti']
+    data_path = ti.xcom_pull(task_ids='data_validation.validate_data_quality')
+    
+    df = pd.read_parquet(data_path)
+    
+    anonymizer = DataAnonymizer()
+    
+    # Anonymize sensitive fields
+    pii_columns = {
+        'customer_id': 'hash',
+        'meter_id': 'hash'
+    }
+    
+    df = anonymizer.anonymize_dataset(df, pii_columns)
+    df = anonymizer.generalize_location(df, 'location_lat', 'location_lon', precision=2)
+    
+    # Save anonymized data
+    execution_date = context['execution_date']
+    anon_path = f"/tmp/anonymized_data_{execution_date.date()}.parquet"
+    df.to_parquet(anon_path)
+    
+    logging.info("Data anonymization completed")
+    return anon_path
+
+
+def feature_engineering(**context):
+    """Create features for ML models"""
+    ti = context['ti']
+    data_path = ti.xcom_pull(task_ids='data_transformation.anonymize_pii')
+    
+    df = pd.read_parquet(data_path)
+    
+    # Initialize model and engineer features
+    model = CreditScoringModel()
+    features_df = model.prepare_features(df)
+    
+    # Save features
+    execution_date = context['execution_date']
+    features_path = f"/tmp/features_{execution_date.date()}.parquet"
+    features_df.to_parquet(features_path)
+    
+    logging.info(f"Feature engineering completed. Shape: {features_df.shape}")
+    return features_path
+
+
+def score_credit_risk(**context):
+    """Score customers using trained model"""
+    ti = context['ti']
+    features_path = ti.xcom_pull(task_ids='ml_tasks.feature_engineering')
+    
+    df = pd.read_parquet(features_path)
+    
+    # Load trained model
+    model = CreditScoringModel()
+    model.load_model('/models/credit_scoring_v1.json')
+    
+    # Generate predictions
+    feature_cols = [col for col in df.columns 
+                   if col not in ['customer_id', 'timestamp', 'default']]
+    X = df[feature_cols]
+    
+    predictions = model.predict(X)
+    df['credit_score'] = predictions
+    df['risk_category'] = pd.cut(
+        predictions, 
+        bins=[0, 0.3, 0.6, 1.0], 
+        labels=['Low', 'Medium', 'High']
+    )
+    
+    # Save scores
+    execution_date = context['execution_date']
+    scores_path = f"/tmp/scores_{execution_date.date()}.parquet"
+    df[['customer_id', 'credit_score', 'risk_category']].to_parquet(scores_path)
+    
+    logging.info(f"Credit scoring completed for {len(df)} customers")
+    return scores_path
+
+
+def upload_to_s3(**context):
+    """Upload processed data to S3 data lake"""
+    ti = context['ti']
+    scores_path = ti.xcom_pull(task_ids='ml_tasks.score_credit_risk')
+    
+    execution_date = context['execution_date']
+    
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    
+    # Upload to S3
+    s3_key = f"processed/credit_scores/year={execution_date.year}/month={execution_date.month:02d}/day={execution_date.day:02d}/scores.parquet"
+    
+    s3_hook.load_file(
+        filename=scores_path,
+        key=s3_key,
+        bucket_name='kenya-energy-data',
+        replace=True
+    )
+    
+    logging.info(f"Data uploaded to s3://kenya-energy-data/{s3_key}")
+
+
+def update_dashboard_metrics(**context):
+    """Update real-time dashboard metrics"""
+    ti = context['ti']
+    scores_path = ti.xcom_pull(task_ids='ml_tasks.score_credit_risk')
+    
+    df = pd.read_parquet(scores_path)
+    
+    # Calculate metrics
+    metrics = {
+        'total_customers': len(df),
+        'high_risk_count': (df['risk_category'] == 'High').sum(),
+        'medium_risk_count': (df['risk_category'] == 'Medium').sum(),
+        'low_risk_count': (df['risk_category'] == 'Low').sum(),
+        'avg_credit_score': df['credit_score'].mean()
+    }
+    
+    logging.info(f"Dashboard metrics: {metrics}")
+    
+    # Push metrics to monitoring system (e.g., Prometheus, CloudWatch)
+    # This would be implemented based on your monitoring stack
+
+
+# Task definitions
+extract_task = PythonOperator(
+    task_id='extract_smart_meter_data',
+    python_callable=extract_smart_meter_data,
+    dag=dag
+)
+
+with TaskGroup('data_validation', dag=dag) as validation_group:
+    validate_task = PythonOperator(
+        task_id='validate_data_quality',
+        python_callable=validate_data_quality
+    )
+
+with TaskGroup('data_transformation', dag=dag) as transformation_group:
+    anonymize_task = PythonOperator(
+        task_id='anonymize_pii',
+        python_callable=anonymize_pii
+    )
+
+with TaskGroup('ml_tasks', dag=dag) as ml_group:
+    feature_task = PythonOperator(
+        task_id='feature_engineering',
+        python_callable=feature_engineering
+    )
+    
+    score_task = PythonOperator(
+        task_id='score_credit_risk',
+        python_callable=score_credit_risk
+    )
+    
+    feature_task >> score_task
+
+upload_task = PythonOperator(
+    task_id='upload_to_s3',
+    python_callable=upload_to_s3,
+    dag=dag
+)
+
+dashboard_task = PythonOperator(
+    task_id='update_dashboard_metrics',
+    python_callable=update_dashboard_metrics,
+    dag=dag
+)
+
+cleanup_task = BashOperator(
+    task_id='cleanup_temp_files',
+    bash_command='rm -f /tmp/raw_data_*.parquet /tmp/anonymized_data_*.parquet /tmp/features_*.parquet /tmp/scores_*.parquet',
+    dag=dag
+)
+
+# Define task dependencies
+extract_task >> validation_group >> transformation_group >> ml_group >> [upload_task, dashboard_task] >> cleanup_task
