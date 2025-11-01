@@ -1,0 +1,127 @@
+# project_structure.txt
+# Complete directory structure for Kenya Energy Access AI System
+
+kenya-energy-ai/
+│
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                    # CI/CD pipeline
+│       └── model_training.yml        # Automated model retraining
+│
+├── data/
+│   ├── raw/                          # Raw data from sources
+│   ├── processed/                    # Cleaned data
+│   ├── features/                     # Feature-engineered data
+│   └── schemas/                      # Data validation schemas
+│
+├── src/
+│   ├── __init__.py
+│   ├── config/
+│   │   ├── __init__.py
+│   │   ├── settings.py               # Configuration management
+│   │   └── logging_config.py         # Logging setup
+│   │
+│   ├── data_pipeline/
+│   │   ├── __init__.py
+│   │   ├── collectors/               # Data collection modules
+│   │   │   ├── smart_meter.py
+│   │   │   ├── satellite.py
+│   │   │   └── grid_data.py
+│   │   ├── etl/
+│   │   │   ├── extract.py
+│   │   │   ├── transform.py
+│   │   │   └── load.py
+│   │   ├── validators.py             # Data quality checks
+│   │   └── anonymizer.py             # PII protection
+│   │
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── credit_scoring/
+│   │   │   ├── model.py
+│   │   │   ├── features.py
+│   │   │   └── evaluation.py
+│   │   ├── site_selection/
+│   │   │   ├── model.py
+│   │   │   └── gis_features.py
+│   │   ├── dispatch_optimization/
+│   │   │   ├── rl_agent.py
+│   │   │   └── environment.py
+│   │   └── forecasting/
+│   │       ├── lstm_model.py
+│   │       └── preprocessing.py
+│   │
+│   ├── monitoring/
+│   │   ├── __init__.py
+│   │   ├── bias_detection.py
+│   │   ├── model_drift.py
+│   │   └── performance_metrics.py
+│   │
+│   └── utils/
+│       ├── __init__.py
+│       ├── db_connector.py
+│       ├── cloud_storage.py
+│       └── helpers.py
+│
+├── airflow/
+│   ├── dags/
+│   │   ├── daily_data_pipeline.py
+│   │   ├── weekly_model_retrain.py
+│   │   └── monitoring_dag.py
+│   └── plugins/
+│
+├── tests/
+│   ├── unit/
+│   │   ├── test_data_pipeline.py
+│   │   ├── test_models.py
+│   │   └── test_validators.py
+│   ├── integration/
+│   │   ├── test_end_to_end.py
+│   │   └── test_api.py
+│   └── fixtures/
+│       └── sample_data.py
+│
+├── notebooks/
+│   ├── 01_exploratory_analysis.ipynb
+│   ├── 02_feature_engineering.ipynb
+│   └── 03_model_experiments.ipynb
+│
+├── api/
+│   ├── __init__.py
+│   ├── main.py                       # FastAPI application
+│   ├── routes/
+│   │   ├── credit_scoring.py
+│   │   ├── site_selection.py
+│   │   └── forecasting.py
+│   └── schemas/
+│       └── requests.py
+│
+├── deployment/
+│   ├── docker/
+│   │   ├── Dockerfile
+│   │   └── docker-compose.yml
+│   ├── kubernetes/
+│   │   ├── deployment.yaml
+│   │   └── service.yaml
+│   └── terraform/
+│       └── main.tf
+│
+├── docs/
+│   ├── architecture.md
+│   ├── api_documentation.md
+│   ├── model_cards/
+│   │   ├── credit_scoring.md
+│   │   └── site_selection.md
+│   └── data_dictionary.md
+│
+├── scripts/
+│   ├── setup_environment.sh
+│   ├── train_model.py
+│   └── deploy_model.py
+│
+├── .gitignore
+├── .env.example
+├── requirements.txt
+├── setup.py
+├── pytest.ini
+├── README.md
+└── LICENSE
